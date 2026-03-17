@@ -26,6 +26,7 @@ type MessageItem = BubbleProps & {
   thinkingStatus?: ThinkingStatus;
   thinlCollapse?: boolean;
   reasoning_content?: string;
+  class?: string;
 };
 const copyIconMap = ref<Record<number, string>>({}); // 记录每条消息的复制按钮图标
 const editingMessageKeys = ref<number[]>([]); // 跟踪多个编辑中的消息
@@ -69,6 +70,173 @@ const isKnowledgePopoverVisible = ref(false);
 const selectedKnowledgeId = ref<string>('');
 const selectedKnowledgeName = ref<string>('知识库');
 const isWorkflowVisible = ref(false);
+const selectedWorkflowName = ref<string>('工作流');
+
+const workflowParams = ref<AnyObject>({
+  pageSize: 10,
+  currentPage: 1,
+});
+
+const workFlowRunner = ref<AnyObject>({});
+const reSumeRunner = ref<AnyObject>({});
+
+// 是否正在加载
+const isWorkflowLoading = ref(false);
+// 是否还有更多数据
+const hasMoreWorkflows = ref(true);
+
+const isResume = ref(false);
+
+const {
+  stream,
+  loading: isLoading,
+  cancel,
+} = useHookFetch({
+  request: send,
+  onError: (err) => {
+    console.warn('测试错误拦截', err);
+  },
+});
+
+// 跟踪当前节点 ID
+let currentNodeId: string | null = null;
+
+// 处理 NODE_CHUNK 事件的函数
+function handleNodeChunk(data: any, isLastChunk = false) {
+  const nodeId = data.nodeId; // 从数据中提取节点 ID
+  const content = data.content; // 从数据中提取内容
+
+  console.log('nodeId-nodeId', nodeId, currentNodeId);
+
+  console.log('content', content);
+
+  // 判断节点 ID 是否发生变化
+
+  if (nodeId && nodeId !== currentNodeId) {
+    // 创建一个新的系统消息气泡
+    if (currentNodeId !== null) {
+      const lastMessage = bubbleItems.value[bubbleItems.value.length - 1];
+      if (lastMessage) {
+        lastMessage.thinkingStatus = 'end';
+        lastMessage.loading = false;
+      }
+    }
+    if (content && currentNodeId !== null) {
+      addMessage('', false); // 添加一个空的系统消息气泡
+    }
+    currentNodeId = nodeId; // 更新当前节点 ID
+  }
+
+  if (nodeId && content) {
+    // 将内容追加到最新的气泡中
+    const lastMessage = bubbleItems.value[bubbleItems.value.length - 1];
+    if (lastMessage && lastMessage.role === 'system') {
+      lastMessage.content += content;
+      lastMessage.thinkingStatus = 'end';
+      lastMessage.loading = false;
+    }
+  }
+
+  if (isLastChunk) {
+    //  如果是最后一块数据，清理空白气泡
+    const lastMessage = bubbleItems.value[bubbleItems.value.length - 1];
+    if (lastMessage && lastMessage.role === 'system' && !lastMessage.content.trim()) {
+      // 删除最后一个空白气泡
+      bubbleItems.value.pop();
+    }
+
+    if (lastMessage) {
+      lastMessage.thinkingStatus = 'end';
+      lastMessage.loading = false;
+    }
+  }
+
+  if (isResume.value) {
+    const lastMessage = bubbleItems.value[bubbleItems.value.length - 1];
+    lastMessage.thinkingStatus = 'end';
+    lastMessage.loading = false;
+    isLoading.value = false;
+  }
+}
+
+function chooseWorkflowItem(item: any) {
+  isWorkflowVisible.value = true;
+  selectedWorkflowName.value = item.title;
+  workFlowRunner.value.uuid = item.uuid;
+  const nodes = [...item.nodes];
+  const user_inputs = nodes[0].inputConfig.user_inputs[0];
+  const inputsObj = {
+    uuid: nodes[0].uuid,
+    name: user_inputs.name,
+    required: user_inputs.required,
+    content: {
+      title: user_inputs.title,
+      value: '',
+      type: user_inputs.type,
+    },
+  };
+
+  workFlowRunner.value.inputs = [inputsObj];
+  isResume.value = false;
+  reSumeRunner.value = {};
+
+  console.log('workFlowRunner', workFlowRunner.value);
+}
+
+// 监听滚动事件
+function handleScroll(event: Event) {
+  const target = event.target as HTMLElement;
+  const { scrollTop, scrollHeight, clientHeight } = target;
+
+  // 判断是否滚动到底部
+  if (
+    scrollTop + clientHeight >= scrollHeight - 10
+    && !isWorkflowLoading.value
+    && hasMoreWorkflows.value
+  ) {
+    loadWorkflowList(true); // 加载更多
+  }
+}
+
+// 加载工作流列表
+async function loadWorkflowList(isLoadMore = false) {
+  if (isWorkflowLoading.value || !hasMoreWorkflows.value)
+    return; // 防止重复请求或无数据时继续加载
+  isWorkflowLoading.value = true;
+  try {
+    const response = await getWorkflowList(workflowParams.value);
+    console.log('工作流列表:', response);
+    if (response?.data && response.data?.records && Array.isArray(response.data.records)) {
+      const newRecords = response.data.records;
+
+      if (isLoadMore) {
+        // 追加数据
+        workflowList.value = [...workflowList.value, ...newRecords];
+      }
+      else {
+        // 替换数据（首次加载）
+        workflowList.value = newRecords;
+      }
+
+      // 更新分页参数
+      workflowParams.value.currentPage += 1;
+
+      // 判断是否还有更多数据
+      hasMoreWorkflows.value = response.data.total > workflowList.value.length;
+    }
+    else {
+      // 如果返回数据为空或格式不正确，标记为无更多数据
+      hasMoreWorkflows.value = false;
+    }
+  }
+  catch (error) {
+    console.error('Failed to load workflow list:', error);
+    hasMoreWorkflows.value = false; // 出错时也停止加载
+  }
+  finally {
+    isWorkflowLoading.value = false;
+  }
+}
 // 加载知识库列表
 async function loadKnowledgeList() {
   try {
@@ -120,8 +288,29 @@ onMounted(async () => {
     isWebSearchEnabled.value = true;
     localStorage.removeItem('enableInternet');
   }
+  const isWorkflow = localStorage.getItem('isWorkflowVisible');
+  if (isWorkflow === 'true') {
+    isWorkflowVisible.value = true;
+    localStorage.removeItem('isWorkflowVisible');
+  }
+
+  const workFlowRunnerStr = localStorage.getItem('workFlowRunner');
+  if (workFlowRunnerStr) {
+    const workFlowRunnerObj = JSON.parse(workFlowRunnerStr);
+    workFlowRunner.value = { ...workFlowRunnerObj };
+    localStorage.removeItem('workFlowRunner');
+  }
+
+  const selectedWorkflowNameStr = localStorage.getItem('selectedWorkflowName');
+  if (selectedWorkflowNameStr) {
+    selectedWorkflowName.value = selectedWorkflowNameStr;
+    localStorage.removeItem('selectedWorkflowName');
+  }
+
   // 加载知识库列表
   await loadKnowledgeList();
+
+  await loadWorkflowList();
 
   // 从 store 中同步知识库选择状态
   if (chatStore.knowledgeId) {
@@ -133,16 +322,6 @@ onMounted(async () => {
   }
 });
 
-const {
-  stream,
-  loading: isLoading,
-  cancel,
-} = useHookFetch({
-  request: send,
-  onError: (err) => {
-    console.warn('测试错误拦截', err);
-  },
-});
 // 记录进入思考中
 let isThinking = false;
 
@@ -189,6 +368,7 @@ watch(
 
 // 封装数据处理逻辑
 function handleDataChunk(chunk: AnyObject) {
+  console.log('isResume', isResume.value);
   try {
     // 新的 SSE 格式：data 字段直接包含内容
     let messageData = chunk.data;
@@ -266,6 +446,11 @@ function handleDataChunk(chunk: AnyObject) {
           lastMessage.reasoning_content += currentText;
         }
         else {
+          if (isResume.value) {
+            lastMessage.thinkingStatus = 'end';
+            lastMessage.loading = false;
+            isLoading.value = false;
+          }
           // 已结束思考模式，内容属于最终回复
           lastMessage.content += currentText;
         }
@@ -283,6 +468,11 @@ function handleError(err: any) {
 }
 
 async function startSSE(chatContent: string) {
+  currentNodeId = null; // 每次发送消息前先置空存储的nodeId 防止多余系统气泡生成
+  if (isWorkflowVisible.value && !Object.prototype.hasOwnProperty.call(workFlowRunner.value, 'inputs')) {
+    ElMessage.error('请选择工作流！');
+    return;
+  }
   try {
     // 添加用户输入的消息
     inputValue.value = '';
@@ -295,11 +485,27 @@ async function startSSE(chatContent: string) {
     // 获取最后一条用户消息（后端做了长期记忆缓存，只需发送最新的用户消息）
     const lastUserMessage = bubbleItems.value.filter((item: any) => item.role === 'user').pop();
 
+    // 转换 role 类型：本地 "ai" -> 后端 "assistant"
+    const convertRole = (role: string): 'user' | 'assistant' | 'system' => {
+      if (role === 'ai')
+        return 'assistant';
+      return role as 'user' | 'assistant' | 'system';
+    };
+
+    // 处理工作流模式下json数据拼接
+    if (isWorkflowVisible.value) {
+      workFlowRunner.value.inputs[0].content.value = chatContent;
+    }
+
+    if (isResume.value) {
+      reSumeRunner.value.feedbackContent = chatContent;
+    }
+
     for await (const chunk of stream({
       messages: lastUserMessage
         ? [
             {
-              role: lastUserMessage.role === 'ai' ? 'assistant' : lastUserMessage.role,
+              role: convertRole(lastUserMessage.role),
               content: lastUserMessage.content,
             },
           ]
@@ -310,6 +516,10 @@ async function startSSE(chatContent: string) {
       enableThinking: isReasoningEnabled.value,
       enableInternet: isWebSearchEnabled.value,
       knowledgeId: chatStore.knowledgeId || undefined,
+      enableWorkFlow: isWorkflowVisible.value,
+      workFlowRunner: workFlowRunner.value,
+      isResume: isResume.value,
+      reSumeRunner: reSumeRunner.value,
     })) {
       // 提取原始数据
       const rawData = chunk.result || chunk.source;
@@ -322,25 +532,106 @@ async function startSSE(chatContent: string) {
       if (rawData === ':disconnected') {
         break;
       }
-      if (typeof rawData === 'string' && rawData.includes('event:') && rawData.includes('data:')) {
-        // 提取 event 类型
-        const eventMatch = rawData.match(/event:(\w+)/);
-        const event = eventMatch?.[1];
-        const dataMatch = rawData.match(/data:([\s\S]*?)(?=\nevent:|$)/);
-        let data = dataMatch?.[1]?.trim();
+      if (typeof rawData === 'string' && rawData.includes('DONE') && rawData.includes('data:')) {
+        isResume.value = false;
+        reSumeRunner.value = {};
+        // 判断是否是最后一块数据
+        handleNodeChunk({}, true);
+      }
+      if (typeof rawData === 'string' && rawData.includes('ERROR') && rawData.includes('data:')) {
+        isResume.value = false;
+        reSumeRunner.value = {};
+      }
+      // if (
+      //   typeof rawData === "string" &&
+      //   rawData.includes("NODE_WAIT_FEEDBACK_BY") &&
+      //   rawData.includes("data:")
+      // ) {
+      //   // 判断是否是最后一块数据
+      //   handleNodeChunk({}, true);
+      // }
 
-        // 清理 data 中可能包含的多余 data: 前缀（当有多行 data: 时）
-        if (data) {
-          data = data
-            .split('\ndata:')
-            .map(line => line.trim())
-            .filter(line => line !== '')
-            .join('\n');
+      if (typeof rawData === 'string' && rawData.includes('START') && rawData.includes('data:')) {
+        isResume.value = true;
+        const dataMatch = rawData.match(/data:([\s\S]*?)(?=\nevent:|$)/);
+        const dataStr = dataMatch?.[1]?.trim();
+        const data = dataStr ? JSON.parse(dataStr) : null;
+        reSumeRunner.value.runtimeUuid = data.uuid;
+      }
+      if (isWorkflowVisible.value) {
+        if (
+          typeof rawData === 'string'
+          && (rawData.includes('NODE_CHUNK') || rawData.includes('NODE_WAIT_FEEDBACK_BY'))
+          && rawData.includes('data:')
+        ) {
+          const eventMatch = rawData.match(/event:([\s\S]*?)\ndata:/);
+          const event = eventMatch ? eventMatch[1] : null;
+
+          let nodeUuid = '';
+          if (event.startsWith('[NODE_CHUNK_')) {
+            nodeUuid = event.replace('[NODE_CHUNK_', '').replace(']', '');
+          }
+          if (event.startsWith('[NODE_WAIT_FEEDBACK_BY_')) {
+            nodeUuid = event.replace('[NODE_WAIT_FEEDBACK_BY_', '').replace(']', '');
+          }
+
+          // 提取 data 字段的内容
+          const dataMatch = rawData.match(/data:([\s\S]*?)(?=\nevent:|$)/);
+          let data = dataMatch?.[1]?.trim();
+          const showData = {
+            nodeId: nodeUuid,
+            content: data,
+          };
+          if (data) {
+            data = data
+              .split('\ndata:')
+              .map(line => line.trim())
+              .filter(line => line !== '')
+              .join('\n');
+          }
+
+          // 判断是否是最后一块数据
+          const isLastChunk = rawData.includes(':disconnected');
+
+          // 调用 handleNodeChunk
+          handleNodeChunk(showData, isLastChunk);
         }
 
-        // 只有当 data 不为空且不是格式错误的 'data:' 字符串时才处理
-        if (event === 'message' && data && data.length > 0 && data !== 'data:') {
-          handleDataChunk({ data });
+        if (typeof rawData === 'string' && rawData.includes('ERROR') && rawData.includes('data:')) {
+          // 提取 data 字段的内容
+          const dataMatch = rawData.match(/data:([\s\S]*?)(?=\nevent:|$)/);
+          const data = dataMatch?.[1]?.trim();
+          if (data && data.length > 0 && data !== 'data:') {
+            handleDataChunk({ data });
+          }
+        }
+      }
+      else {
+        if (
+          typeof rawData === 'string'
+          && rawData.includes('event:')
+          && rawData.includes('data:')
+        ) {
+          // 提取 event 类型
+          const eventMatch = rawData.match(/event:(\w+)/);
+          const event = eventMatch?.[1];
+          const dataMatch = rawData.match(/data:([\s\S]*?)(?=\nevent:|$)/);
+          let data = dataMatch?.[1]?.trim();
+
+          // 清理 data 中可能包含的多余 data: 前缀（当有多行 data: 时）
+          if (data) {
+            data = data
+              .split('\ndata:')
+              .map(line => line.trim())
+              .filter(line => line !== '')
+              .join('\n');
+          }
+
+          // 只有当 data 不为空且不是格式错误的 'data:' 字符串时才处理
+
+          if (event === 'message' && data && data.length > 0 && data !== 'data:') {
+            handleDataChunk({ data });
+          }
         }
       }
     }
@@ -428,7 +719,7 @@ function startEditing(item: MessageItem) {
   }
   // ⭐ 关键：关闭 Bubble 样式
   item.noStyle = true;
-  (item as any).class = 'editing-bubble'; // ⭐ 新增
+  item.class = 'editing-bubble'; // ⭐ 新增
 }
 
 // Cancel editing and revert to original content
@@ -436,7 +727,7 @@ function cancelEditingByKey(key: number) {
   const item = bubbleItems.value.find(i => i.key === key);
   if (item) {
     item.noStyle = false; // 恢复气泡
-    (item as any).class = '';
+    item.class = '';
   }
   editingMessageKeys.value = editingMessageKeys.value.filter(k => k !== key);
   delete editedContents.value[key];
@@ -696,26 +987,38 @@ watch(
                   :width="280"
                   trigger="click"
                   popper-class="knowledge-popover"
-                  @show="isWorkflowVisible = true"
-                  @hide="isWorkflowVisible = false"
                 >
                   <template #default>
                     <div class="knowledge-list-container">
-                      <div class="knowledge-list">
-                        <div v-for="item in workflowList" :key="item.id" class="knowledge-item">
+                      <div class="knowledge-list" @scroll="handleScroll">
+                        <div
+                          v-for="item in workflowList"
+                          :key="item.id"
+                          class="knowledge-item"
+                          :class="{ 'is-selected': selectedWorkflowName === item.title }"
+                          @click="chooseWorkflowItem(item)"
+                        >
                           <div class="item-name">
-                            {{ item.name }}
+                            {{ item.title }}
                           </div>
+                        </div>
+                        <!-- 加载提示 -->
+                        <div v-if="isWorkflowLoading" class="loading-tip">
+                          加载中...
                         </div>
                       </div>
                     </div>
                   </template>
                   <template #reference>
-                    <div class="feature-btn">
+                    <div
+                      class="feature-btn"
+                      :class="{ active: isWorkflowVisible }"
+                      @click="isWorkflowVisible = !isWorkflowVisible"
+                    >
                       <el-icon class="feature-icon">
                         <SetUp />
                       </el-icon>
-                      <span class="feature-text">工作流</span>
+                      <span class="feature-text">{{ selectedWorkflowName }}</span>
                     </div>
                   </template>
                 </el-popover>
@@ -1185,6 +1488,13 @@ watch(
       }
     }
   }
+}
+
+.loading-tip {
+  text-align: center;
+  padding: 12px;
+  font-size: 14px;
+  color: #909399;
 }
 
 // 清除按钮
