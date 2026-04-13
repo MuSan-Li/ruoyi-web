@@ -1,5 +1,6 @@
 <!-- 默认消息列表页 -->
 <script setup lang="ts">
+import type { AnyObject } from 'typescript-api-pro';
 import type { FilesCardProps } from 'vue-element-plus-x/types/FilesCard';
 import { nextTick, onMounted, ref, watch } from 'vue';
 import { Sender } from 'vue-element-plus-x';
@@ -342,17 +343,7 @@ onMounted(() => {
               <el-icon class="feature-icon">
                 <Operation />
               </el-icon>
-              <span class="feature-text">推理</span>
-            </div>
-            <div
-              class="feature-btn"
-              :class="{ active: isWebSearchEnabled }"
-              @click="isWebSearchEnabled = !isWebSearchEnabled"
-            >
-              <el-icon class="feature-icon">
-                <ChromeFilled />
-              </el-icon>
-              <span class="feature-text">联网</span>
+              <span class="feature-text">智能推理</span>
             </div>
 
             <el-popover

@@ -5,12 +5,13 @@ import type { BubbleProps } from 'vue-element-plus-x/types/Bubble';
 import type { BubbleListInstance } from 'vue-element-plus-x/types/BubbleList';
 import type { FilesCardProps } from 'vue-element-plus-x/types/FilesCard';
 import type { ThinkingStatus } from 'vue-element-plus-x/types/Thinking';
+import type { ToolCallInfo } from './types';
 import { useHookFetch } from 'hook-fetch/vue';
 import { nextTick } from 'vue';
 import { Sender } from 'vue-element-plus-x';
 import { useRoute } from 'vue-router';
 import { send } from '@/api';
-import { getKnowledgeList } from '@/api/chat';
+import { getKnowledgeList, getWorkflowList } from '@/api/chat';
 import FilesSelect from '@/components/FilesSelect/index.vue';
 import ModelSelect from '@/components/ModelSelect/index.vue';
 import { useChatStore } from '@/stores/modules/chat';
@@ -19,6 +20,7 @@ import { useModelStore } from '@/stores/modules/model';
 import { useSessionStore } from '@/stores/modules/session';
 import { useUserStore } from '@/stores/modules/user';
 import { codeXRender } from '@/utils/markdownRenderers';
+import ToolCallCard from './components/ToolCallCard.vue';
 
 type MessageItem = BubbleProps & {
   key: number;
@@ -29,9 +31,6 @@ type MessageItem = BubbleProps & {
   reasoning_content?: string;
   class?: string;
 };
-const copyIconMap = ref<Record<number, string>>({}); // 记录每条消息的复制按钮图标
-const editingMessageKeys = ref<number[]>([]); // 跟踪多个编辑中的消息
-const editedContents = ref<Record<number, string>>({}); // 存储每条消息的临时编辑内容
 
 const route = useRoute();
 const chatStore = useChatStore();
@@ -51,9 +50,20 @@ const senderRef = ref<InstanceType<typeof Sender> | null>(null);
 const bubbleItems = ref<MessageItem[]>([]);
 const bubbleListRef = ref<BubbleListInstance | null>(null);
 
-// 推理和联网开关状态
+// 独立的工具调用事件列表
+const toolCallEvents = ref<ToolCallInfo[]>([]);
+// 工具调用事件计数器（用于生成唯一 key）
+let toolCallKeyCounter = 0;
+
+// 是否有工具调用事件
+const hasToolCallEvents = computed(() => toolCallEvents.value.length > 0);
+
+const copyIconMap = ref<Record<number, string>>({}); // 记录每条消息的复制按钮图标
+const editingMessageKeys = ref<number[]>([]); // 跟踪多个编辑中的消息
+const editedContents = ref<Record<number, string>>({}); // 存储每条消息的临时编辑内容
+
+// 推理开关状态
 const isReasoningEnabled = ref(false);
-const isWebSearchEnabled = ref(false);
 
 // 知识库列表配置
 const knowledgeList = ref<any[]>([]);
@@ -223,11 +233,6 @@ onMounted(async () => {
     isReasoningEnabled.value = true;
     localStorage.removeItem('enableThinking');
   }
-  const enableInternet = localStorage.getItem('enableInternet');
-  if (enableInternet === 'true') {
-    isWebSearchEnabled.value = true;
-    localStorage.removeItem('enableInternet');
-  }
   const isWorkflow = localStorage.getItem('isWorkflowVisible');
   if (isWorkflow === 'true') {
     isWorkflowVisible.value = true;
@@ -269,6 +274,10 @@ watch(
   () => route.params?.id,
   async (_id_) => {
     if (_id_) {
+      // 切换会话时清空工具调用事件
+      toolCallEvents.value = [];
+      toolCallKeyCounter = 0;
+
       if (_id_ !== 'not_login') {
         // 判断的当前会话id是否有聊天记录，有缓存则直接赋值展示
         if (chatStore.chatMap[`${_id_}`] && chatStore.chatMap[`${_id_}`].length) {
@@ -317,6 +326,10 @@ async function startSSE(chatContent: string) {
     return;
   }
   try {
+    // 清空上一次的工具调用事件
+    toolCallEvents.value = [];
+    toolCallKeyCounter = 0;
+
     // 添加用户输入的消息
     inputValue.value = '';
     addMessage(chatContent, true);
@@ -345,7 +358,6 @@ async function startSSE(chatContent: string) {
       content: lastUserMessage?.content ?? '',
       sessionId: route.params?.id !== 'not_login' ? String(route.params?.id) : undefined,
       enableThinking: isReasoningEnabled.value,
-      enableInternet: isWebSearchEnabled.value,
       knowledgeId: chatStore.knowledgeId || undefined,
       workFlowRunner: isWorkflowVisible.value ? workFlowRunner.value : undefined,
       reSumeRunner: isResume.value ? reSumeRunner.value : undefined,
@@ -354,7 +366,7 @@ async function startSSE(chatContent: string) {
     })) {
       // 处理数据块 - chunk.result 可能是字符串或对象
       // 返回 true 表示流结束
-      const isStreamEnd = handleDataChunk(chunk.result);
+      const isStreamEnd = handleDataChunk(chunk.result as AnyObject | string);
 
       // 在收到第一个有效数据后清除 loading 状态（跳过连接状态事件）
       if (!hasReceivedFirstContent && chunk.result !== ':connected' && chunk.result !== ':disconnected' && !isStreamEnd) {
@@ -440,6 +452,12 @@ function handleDataChunk(chunk: AnyObject | string): boolean {
         return true; // 返回 true 表示结束
       }
 
+      // 处理 MCP 工具调用事件
+      if (eventType === 'mcp' && dataObj) {
+        handleMcpEvent(dataObj);
+        return false;
+      }
+
       // 使用解析后的数据对象
       if (dataObj && eventType === 'content') {
         const content = dataObj.content || '';
@@ -491,6 +509,70 @@ function handleDataChunk(chunk: AnyObject | string): boolean {
   }
 
   return false;
+}
+
+/**
+ * 处理 MCP 工具调用事件
+ * pending 事件新增卡片，success/error 事件更新对应卡片状态
+ */
+function handleMcpEvent(dataObj: AnyObject) {
+  console.log('[SSE] MCP 事件:', dataObj);
+
+  try {
+    // 解析 content 字段（可能是 JSON 字符串）
+    const content = typeof dataObj.content === 'string'
+      ? JSON.parse(dataObj.content)
+      : dataObj.content;
+
+    const toolName = content.name || 'Unknown Tool';
+    const toolStatus = content.status || 'pending';
+    const toolResult = content.result || null;
+
+    if (toolStatus === 'pending') {
+      // pending 状态：新增工具调用卡片
+      const toolInfo: ToolCallInfo = {
+        key: ++toolCallKeyCounter,
+        name: toolName,
+        status: 'pending',
+        result: null,
+        timestamp: Date.now(),
+      };
+      toolCallEvents.value = [...toolCallEvents.value, toolInfo];
+    }
+    else {
+      // success/error 状态：查找并更新对应的 pending 卡片
+      const index = toolCallEvents.value.findIndex(
+        t => t.name === toolName && t.status === 'pending',
+      );
+      if (index >= 0) {
+        // 更新现有卡片状态
+        const updatedEvents = [...toolCallEvents.value];
+        updatedEvents[index] = {
+          ...updatedEvents[index],
+          status: toolStatus,
+          result: toolResult,
+          timestamp: Date.now(),
+        };
+        toolCallEvents.value = updatedEvents;
+      }
+      else {
+        // 如果没有找到对应的 pending 卡片，新增一个
+        const toolInfo: ToolCallInfo = {
+          key: ++toolCallKeyCounter,
+          name: toolName,
+          status: toolStatus,
+          result: toolResult,
+          timestamp: Date.now(),
+        };
+        toolCallEvents.value = [...toolCallEvents.value, toolInfo];
+      }
+    }
+
+    console.log('[SSE] 工具调用列表:', toolCallEvents.value);
+  }
+  catch (err) {
+    console.error('[SSE] MCP 事件解析失败:', err);
+  }
 }
 
 /**
@@ -672,6 +754,17 @@ watch(
         />
       </div> -->
 
+      <!-- 工具调用事件区域 - 独立于 BubbleList，实时更新 -->
+      <Transition name="tool-events-fade">
+        <div v-if="hasToolCallEvents" class="tool-events-wrapper">
+          <ToolCallCard
+            v-for="tool in toolCallEvents"
+            :key="tool.key"
+            :tool-info="tool"
+          />
+        </div>
+      </Transition>
+
       <BubbleList ref="bubbleListRef" :list="bubbleItems" max-height="calc(100vh - 240px)">
         <template #header="{ item }">
           <Thinking
@@ -851,7 +944,7 @@ watch(
                 </template>
               </el-popover>
 
-              <!-- 推理和联网按钮 -->
+              <!-- 智能推理按钮 -->
               <div class="feature-buttons">
                 <div
                   class="feature-btn"
@@ -861,17 +954,7 @@ watch(
                   <el-icon class="feature-icon">
                     <Operation />
                   </el-icon>
-                  <span class="feature-text">推理</span>
-                </div>
-                <div
-                  class="feature-btn"
-                  :class="{ active: isWebSearchEnabled }"
-                  @click="isWebSearchEnabled = !isWebSearchEnabled"
-                >
-                  <el-icon class="feature-icon">
-                    <ChromeFilled />
-                  </el-icon>
-                  <span class="feature-text">联网</span>
+                  <span class="feature-text">智能推理</span>
                 </div>
 
                 <el-popover
@@ -1034,6 +1117,23 @@ watch(
       margin-bottom: 12px;
     }
 
+    // 工具调用事件区域 - 独立显示
+    .tool-events-wrapper {
+      padding: 12px;
+    }
+
+    // 工具事件过渡动画
+    .tool-events-fade-enter-active,
+    .tool-events-fade-leave-active {
+      transition: all 0.3s ease;
+    }
+
+    .tool-events-fade-enter-from,
+    .tool-events-fade-leave-to {
+      opacity: 0;
+      transform: translateY(-10px);
+    }
+
     // Sender 输入框包装器
     .sender-wrapper {
       position: relative;
@@ -1079,7 +1179,7 @@ watch(
       }
     }
 
-    // 推理和联网按钮样式
+    // 智能推理按钮样式
     .feature-buttons {
       display: flex;
       gap: 8px;
